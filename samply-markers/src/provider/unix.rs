@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::fs::File;
+use std::io::BufWriter;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -22,9 +23,33 @@ use nix::time::ClockId;
 #[cfg(target_os = "linux")]
 use nix::time::clock_gettime;
 
-use smallstr::SmallString;
 use tempfile::TempDir;
 use tempfile::tempdir;
+
+/// A wrapper around [`BufWriter`] that flushes on drop to ensure data is written.
+///
+/// This is used in conjunction with [`thread_local!`] to ensure that buffers are
+/// flushed when the thread exits.
+struct FlushOnDrop(BufWriter<File>);
+
+impl Drop for FlushOnDrop {
+    fn drop(&mut self) {
+        self.0.flush().expect("failed to flush marker-file buffer.");
+    }
+}
+
+impl std::ops::Deref for FlushOnDrop {
+    type Target = BufWriter<File>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for FlushOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 /// A lazily created directory that holds per-thread mmapped marker files.
 static MARKERS_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
@@ -35,8 +60,11 @@ static MARKERS_DIR: LazyLock<Option<PathBuf>> = LazyLock::new(|| {
 });
 
 thread_local! {
-    /// A thread-local file used to append marker lines that samply will ingest.
-    static MARKER_FILE: RefCell<Option<File>> = RefCell::new(create_marker_file());
+    /// A thread-local buffered writer used to append marker lines that samply will ingest.
+    static MARKER_FILE: RefCell<Option<FlushOnDrop>> = RefCell::new(create_marker_file());
+
+    /// A thread-local buffer for formatting markers, reused across emissions to avoid allocations.
+    static FORMAT_BUFFER: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
 #[cfg(target_os = "macos")]
@@ -95,30 +123,30 @@ pub struct WriteMarkerImpl;
 impl WriteMarkerProvider for WriteMarkerImpl {
     /// Serializes the marker to the thread-local file, creating it on demand.
     fn write_marker(start: SamplyTimestamp, end: SamplyTimestamp, marker: &SamplyMarker) {
-        let mut s = SmallString::<[u8; 64]>::new();
-        start.fmt(&mut s).unwrap();
-        s.push(' ');
-        end.fmt(&mut s).unwrap();
-        s.push(' ');
-        s.push_str(marker.name());
-        s.push('\n');
-        let _ = with_marker_file(|f| f.write_all(s.as_bytes()));
+        let _ = FORMAT_BUFFER.with_borrow_mut(|buffer| {
+            buffer.clear();
+
+            // Format: "{start_ns} {end_ns} {marker_name}\n"
+            let _ = start.fmt(buffer);
+            buffer.push(' ');
+
+            let _ = end.fmt(buffer);
+            buffer.push(' ');
+
+            buffer.push_str(marker.name());
+            buffer.push('\n');
+
+            MARKER_FILE.with_borrow_mut(|file| {
+                file.as_mut()
+                    .map_or(Ok(()), |f| f.write_all(buffer.as_bytes()))
+            })
+        });
     }
 }
 
 /// Returns the lazily-created temporary markers directory, if available.
 fn markers_dir() -> Option<&'static Path> {
     Some(LazyLock::force(&MARKERS_DIR).as_ref()?)
-}
-
-/// Executes the provided closure with a mutable handle to the thread-local marker file.
-///
-/// Returns [`None`] when the file could not be prepared.
-fn with_marker_file<F, R>(f: F) -> Option<R>
-where
-    F: FnOnce(&mut File) -> R,
-{
-    MARKER_FILE.with_borrow_mut(|file| file.as_mut().map(f))
 }
 
 /// Returns a unique thread identifier for the current thread.
@@ -159,7 +187,7 @@ fn get_thread_id() -> u32 {
 }
 
 /// Creates a new mmapped marker file for the current thread.
-fn create_marker_file() -> Option<File> {
+fn create_marker_file() -> Option<FlushOnDrop> {
     let file_name = markers_dir()?.join(format!(
         "marker-{}-{}.txt",
         nix::unistd::getpid().as_raw(),
@@ -216,5 +244,36 @@ fn create_marker_file() -> Option<File> {
     })
     .ok()?;
 
-    Some(file)
+    // I benchmarked the buffer size with hyperfine, using the Fibonacci example
+    // given n = 30, which generates about 2.7 million markers per run.
+    //
+    // Ubuntu results:
+    // ------------------------------------------
+    //     4 KiB: 470.9 ms ± 1.2 ms (5.3% slower)
+    //     8 KiB: 457.4 ms ± 2.1 ms (2.2% slower)
+    //    16 KiB: 451.0 ms ± 1.3 ms (0.8% slower)
+    //    32 KiB: 447.6 ms ± 1.5 ms (0.1% slower)
+    //    64 KiB: 447.4 ms ± 2.9 ms [optimal speed]
+    //   128 KiB: 448.6 ms ± 1.1 ms (0.3% slower)
+    //   256 KiB: 450.5 ms ± 1.4 ms (0.7% slower)
+    //   512 KiB: 450.1 ms ± 1.1 ms (0.6% slower)
+    //  1024 KiB: 449.9 ms ± 2.6 ms (0.6% slower)
+    //
+    // macOS results:
+    // ------------------------------------------
+    //     4 KiB: 303.0 ms ± 2.5 ms (43.9% slower)
+    //     8 KiB: 258.3 ms ± 1.2 ms (22.6% slower)
+    //    16 KiB: 236.4 ms ± 1.2 ms (12.2% slower)
+    //    32 KiB: 223.4 ms ± 0.7 ms (06.0% slower)
+    //    64 KiB: 217.2 ms ± 1.2 ms (03.1% slower)
+    //   128 KiB: 213.3 ms ± 0.7 ms (01.3% slower)
+    //   256 KiB: 211.9 ms ± 1.3 ms (00.6% slower)
+    //   512 KiB: 210.6 ms ± 0.7 ms [optimal speed]
+    //  1024 KiB: 210.7 ms ± 0.7 ms (00.0% slower)
+    //
+    // Even though macOS benefitted from a larger buffer size,
+    // I feel like a 512 KiB buffer per thread feels like overkill.
+    //
+    // 64 KiB feels like a good balance based on this benchmark.
+    Some(FlushOnDrop(BufWriter::with_capacity(64 * 1024, file)))
 }

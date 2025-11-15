@@ -46,9 +46,9 @@ $TARGET/release/samply record $TARGET/profiling/examples/02_network_requests
 ```
 
 [cargo metadata]: https://doc.rust-lang.org/cargo/commands/cargo-metadata.html
-[fib-example-macos]: https://share.firefox.dev/43vY4G8
-[fib-example-ubuntu]: https://share.firefox.dev/3XAGkpu
-[network-example-macos]: https://share.firefox.dev/3M2zMxq
-[network-example-ubuntu]: https://share.firefox.dev/4r7bgeW
+[fib-example-macos]: https://share.firefox.dev/3WYOibS
+[fib-example-ubuntu]: https://share.firefox.dev/3M31SZq
+[network-example-macos]: https://share.firefox.dev/48eHTj8
+[network-example-ubuntu]: https://share.firefox.dev/3LzT6lJ
 [jq]: https://jqlang.github.io/jq/
 [samply]: https://github.com/mstange/samply?tab=readme-ov-file#samply

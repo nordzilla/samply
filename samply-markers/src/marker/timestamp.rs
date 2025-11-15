@@ -47,7 +47,8 @@ impl SamplyTimestamp {
     where
         W: std::fmt::Write + ?Sized,
     {
-        std::fmt::Write::write_fmt(writer, format_args!("{}", self.0))
+        let mut buffer = itoa::Buffer::new();
+        writer.write_str(buffer.format(self.0))
     }
 }
 
